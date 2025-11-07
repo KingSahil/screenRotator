@@ -1,34 +1,34 @@
 """
-Screen Rotator Application
-Rotates the screen while preserving correct mouse movement by adjusting coordinates
-based on the current screen orientation.
+Screen Rotator GUI Application
+Features: System tray, keyboard shortcuts, mouse remapping, auto-startup
 """
 
 import ctypes
 from ctypes import wintypes
 import time
 import threading
-import atexit
-import msvcrt
 import sys
+import os
+import winreg
+from pathlib import Path
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    import pystray
+    from pystray import MenuItem as item
+    from PIL import Image, ImageDraw
+except ImportError as e:
+    print(f"Missing required package: {e}")
+    print("\nPlease install required packages:")
+    print("pip install pillow pystray")
+    sys.exit(1)
 
 # Constants for display orientation
 DMDO_DEFAULT = 0  # 0 degrees
 DMDO_90 = 1       # 90 degrees
 DMDO_180 = 2      # 180 degrees
 DMDO_270 = 3      # 270 degrees
-
-# Mouse hook constants
-WH_MOUSE_LL = 14
-WM_MOUSEMOVE = 0x0200
-HC_ACTION = 0
-
-# Keyboard hook constants
-WH_KEYBOARD_LL = 13
-WM_KEYDOWN = 0x0100
-WM_KEYUP = 0x0101
-WM_SYSKEYDOWN = 0x0104
-WM_SYSKEYUP = 0x0105
 
 # Virtual key codes
 VK_LEFT = 0x25
@@ -37,6 +37,21 @@ VK_RIGHT = 0x27
 VK_DOWN = 0x28
 VK_CONTROL = 0x11
 VK_MENU = 0x12  # Alt key
+
+# Cursor constants
+OCR_NORMAL = 32512
+OCR_IBEAM = 32513
+OCR_WAIT = 32514
+OCR_CROSS = 32515
+OCR_UP = 32516
+OCR_SIZENWSE = 32642
+OCR_SIZENESW = 32643
+OCR_SIZEWE = 32644
+OCR_SIZENS = 32645
+OCR_SIZEALL = 32646
+OCR_NO = 32648
+OCR_HAND = 32649
+OCR_APPSTARTING = 32650
 
 # Windows API structures
 class DEVMODE(ctypes.Structure):
@@ -76,27 +91,25 @@ class DEVMODE(ctypes.Structure):
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
-class MSLLHOOKSTRUCT(ctypes.Structure):
+class ICONINFO(ctypes.Structure):
     _fields_ = [
-        ("pt", POINT),
-        ("mouseData", wintypes.DWORD),
-        ("flags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", wintypes.LPVOID)
+        ("fIcon", wintypes.BOOL),
+        ("xHotspot", wintypes.DWORD),
+        ("yHotspot", wintypes.DWORD),
+        ("hbmMask", wintypes.HBITMAP),
+        ("hbmColor", wintypes.HBITMAP)
     ]
 
-class KBDLLHOOKSTRUCT(ctypes.Structure):
+class CURSORINFO(ctypes.Structure):
     _fields_ = [
-        ("vkCode", wintypes.DWORD),
-        ("scanCode", wintypes.DWORD),
+        ("cbSize", wintypes.DWORD),
         ("flags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", wintypes.LPVOID)
+        ("hCursor", wintypes.HANDLE),  # Use HANDLE instead of HCURSOR
+        ("ptScreenPos", POINT)
     ]
 
 # Windows API functions
 user32 = ctypes.windll.user32
-gdi32 = ctypes.windll.gdi32
 
 # Constants
 ENUM_CURRENT_SETTINGS = -1
@@ -106,11 +119,100 @@ DM_DISPLAYORIENTATION = 0x00000080
 DM_PELSWIDTH = 0x00080000
 DM_PELSHEIGHT = 0x00100000
 
+class CursorRotator:
+    """
+    Handles cursor rotation to match screen orientation
+    
+    Note: Windows API limitations mean we can only change cursor style, not truly rotate it.
+    This implementation changes cursor appearance based on orientation:
+    - 0°: Normal arrow cursor
+    - 90°: Cross cursor (sideways indicator)
+    - 180°: Up arrow cursor (inverted indicator)
+    - 270°: Cross cursor (sideways indicator)
+    """
+    def __init__(self):
+        self.current_orientation = DMDO_DEFAULT
+        self.enabled = False
+        self.running = False
+        self.thread = None
+        self.target_cursor = None
+        
+    def monitor_cursor_thread(self):
+        """Background thread to maintain cursor style"""
+        while self.running:
+            if self.enabled and self.target_cursor:
+                try:
+                    # Get current cursor info
+                    cursor_info = CURSORINFO()
+                    cursor_info.cbSize = ctypes.sizeof(CURSORINFO)
+                    
+                    if user32.GetCursorInfo(ctypes.byref(cursor_info)):
+                        # Only set if cursor is visible and different
+                        if cursor_info.flags == 1:  # CURSOR_SHOWING
+                            current = user32.GetCursor()
+                            if current != self.target_cursor:
+                                user32.SetCursor(self.target_cursor)
+                except:
+                    pass
+                    
+            time.sleep(0.05)  # Check every 50ms
+    
+    def start(self):
+        """Start cursor monitoring thread"""
+        if not self.running:
+            self.running = True
+            self.thread = threading.Thread(target=self.monitor_cursor_thread, daemon=True)
+            self.thread.start()
+    
+    def stop(self):
+        """Stop cursor monitoring thread"""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1)
+            
+    def rotate_cursors(self, orientation):
+        """Change cursor style to match orientation"""
+        self.current_orientation = orientation
+        
+        try:
+            if orientation == DMDO_DEFAULT:
+                # Normal arrow cursor
+                self.target_cursor = user32.LoadCursorW(None, OCR_NORMAL)
+                self.enabled = False
+                
+            elif orientation == DMDO_90 or orientation == DMDO_270:
+                # Use CROSS cursor for 90° and 270° (indicates rotation)
+                self.target_cursor = user32.LoadCursorW(None, OCR_CROSS)
+                self.enabled = True
+                    
+            elif orientation == DMDO_180:
+                # Use UP arrow for 180° (inverted indicator)  
+                self.target_cursor = user32.LoadCursorW(None, OCR_UP)
+                self.enabled = True
+            
+            # Set the cursor immediately
+            if self.target_cursor:
+                user32.SetCursor(self.target_cursor)
+            
+            # Start monitoring if not already running
+            if self.enabled and not self.running:
+                self.start()
+                    
+        except Exception as e:
+            print(f"Error rotating cursor: {e}")
+    
+    def restore_cursors(self):
+        """Restore original system cursors"""
+        try:
+            self.enabled = False
+            self.target_cursor = user32.LoadCursorW(None, OCR_NORMAL)
+            if self.target_cursor:
+                user32.SetCursor(self.target_cursor)
+        except Exception as e:
+            print(f"Error restoring cursors: {e}")
+
 class MouseRemapper:
-    """
-    Simpler mouse remapping using input redirection
-    This approach transforms mouse sensitivity rather than hooking events
-    """
+    """Enhanced mouse remapping with smooth operation"""
     def __init__(self):
         self.enabled = False
         self.current_orientation = DMDO_DEFAULT
@@ -118,56 +220,57 @@ class MouseRemapper:
         self.screen_height = 0
         self.thread = None
         self.running = False
+        self.last_update_time = 0
         
     def set_orientation(self, orientation, width, height):
         """Update the current orientation and screen dimensions"""
         self.current_orientation = orientation
         self.screen_width = width
         self.screen_height = height
-        
-    def transform_coordinates(self, x, y):
-        """Transform coordinates based on screen orientation"""
-        if self.current_orientation == DMDO_DEFAULT:  # 0°
-            return x, y
-        elif self.current_orientation == DMDO_90:  # 90°
-            # Rotate coordinates 90° clockwise
-            return self.screen_height - y, x
-        elif self.current_orientation == DMDO_180:  # 180°
-            return self.screen_width - x, self.screen_height - y
-        elif self.current_orientation == DMDO_270:  # 270°
-            return y, self.screen_width - x
-        return x, y
     
     def remap_thread(self):
         """Background thread that monitors and adjusts mouse position"""
         last_pos = POINT()
         user32.GetCursorPos(ctypes.byref(last_pos))
+        last_raw_pos = (last_pos.x, last_pos.y)
+        moved_by_us = False
         
         while self.running:
-            if self.current_orientation == DMDO_DEFAULT:
-                # No remapping needed at 0°
+            if self.current_orientation == DMDO_DEFAULT or not self.enabled:
                 time.sleep(0.01)
                 continue
-                
+            
             current_pos = POINT()
             user32.GetCursorPos(ctypes.byref(current_pos))
+            current_raw = (current_pos.x, current_pos.y)
             
-            # Calculate movement delta
+            # Check if we just moved the cursor
+            if moved_by_us:
+                moved_by_us = False
+                last_raw_pos = current_raw
+                last_pos.x = current_pos.x
+                last_pos.y = current_pos.y
+                time.sleep(0.002)
+                continue
+            
+            # Calculate delta from last known position
             dx = current_pos.x - last_pos.x
             dy = current_pos.y - last_pos.y
             
-            if dx != 0 or dy != 0:
+            # Only process if there's actual movement
+            if abs(dx) > 0 or abs(dy) > 0:
                 # Transform the delta based on orientation
-                if self.current_orientation == DMDO_90:  # 90°
+                if self.current_orientation == DMDO_90:  # 90° CW
                     new_dx, new_dy = -dy, dx
                 elif self.current_orientation == DMDO_180:  # 180°
                     new_dx, new_dy = -dx, -dy
-                elif self.current_orientation == DMDO_270:  # 270°
+                elif self.current_orientation == DMDO_270:  # 270° CW (90° CCW)
                     new_dx, new_dy = dy, -dx
                 else:
                     new_dx, new_dy = dx, dy
                 
-                # Calculate new position
+                # Calculate new position based on LAST position + transformed delta
+                # This prevents feedback loops
                 new_x = last_pos.x + new_dx
                 new_y = last_pos.y + new_dy
                 
@@ -175,28 +278,34 @@ class MouseRemapper:
                 new_x = max(0, min(self.screen_width - 1, new_x))
                 new_y = max(0, min(self.screen_height - 1, new_y))
                 
-                # Set cursor to new position
-                user32.SetCursorPos(new_x, new_y)
-                
-                # Update last position
-                last_pos.x = new_x
-                last_pos.y = new_y
+                # Only move if position changed
+                if new_x != current_pos.x or new_y != current_pos.y:
+                    user32.SetCursorPos(new_x, new_y)
+                    moved_by_us = True
+                    # Update last position to where we moved it
+                    last_pos.x = new_x
+                    last_pos.y = new_y
+                else:
+                    # Position didn't change, just update tracking
+                    last_pos.x = current_pos.x
+                    last_pos.y = current_pos.y
+            else:
+                # No movement, just update tracking
+                last_pos.x = current_pos.x
+                last_pos.y = current_pos.y
             
-            time.sleep(0.001)  # Poll every 1ms for smooth movement
+            last_raw_pos = current_raw
+            time.sleep(0.002)  # 2ms polling for smooth movement
     
     def start(self):
         """Start the mouse remapping"""
         if self.enabled:
-            print("Mouse remapping is already enabled")
             return
         
         self.enabled = True
         self.running = True
         self.thread = threading.Thread(target=self.remap_thread, daemon=True)
         self.thread.start()
-        print("✓ Mouse remapping enabled - movements now follow screen rotation")
-        if self.current_orientation == DMDO_DEFAULT:
-            print("  (Currently at 0° - no transformation needed)")
     
     def stop(self):
         """Stop the mouse remapping"""
@@ -208,15 +317,11 @@ class MouseRemapper:
         if self.thread:
             self.thread.join(timeout=0.5)
             self.thread = None
-        print("✓ Mouse remapping disabled")
-
-# Global mouse remapper instance
-mouse_remapper = MouseRemapper()
 
 class KeyboardMonitor:
     """Monitors keyboard for hotkey combinations using polling"""
-    def __init__(self, rotator):
-        self.rotator = rotator
+    def __init__(self, callback):
+        self.callback = callback
         self.enabled = False
         self.thread = None
         self.running = False
@@ -231,14 +336,12 @@ class KeyboardMonitor:
         combo_time = 0
         
         while self.running:
-            # Check if Ctrl and Alt are pressed
             ctrl = self.is_key_pressed(VK_CONTROL)
             alt = self.is_key_pressed(VK_MENU)
             
             if ctrl and alt:
                 current_time = time.time()
                 
-                # Check arrow keys
                 if self.is_key_pressed(VK_UP):
                     combo = 'UP'
                 elif self.is_key_pressed(VK_DOWN):
@@ -250,44 +353,24 @@ class KeyboardMonitor:
                 else:
                     combo = None
                 
-                # Execute action if combo changed and debounce (0.3s)
                 if combo and (combo != last_combo or current_time - combo_time > 0.3):
-                    if combo == 'UP':
-                        print("\n[Hotkey] Ctrl+Alt+Up - Rotating to 0° (Default)")
-                        self.rotator.rotate_screen(DMDO_DEFAULT)
-                    elif combo == 'DOWN':
-                        print("\n[Hotkey] Ctrl+Alt+Down - Rotating to 180°")
-                        self.rotator.rotate_screen(DMDO_180)
-                    elif combo == 'LEFT':
-                        print("\n[Hotkey] Ctrl+Alt+Left - Rotating to 270°")
-                        self.rotator.rotate_screen(DMDO_270)
-                    elif combo == 'RIGHT':
-                        print("\n[Hotkey] Ctrl+Alt+Right - Rotating to 90°")
-                        self.rotator.rotate_screen(DMDO_90)
-                    
+                    self.callback(combo)
                     last_combo = combo
                     combo_time = current_time
             else:
                 last_combo = None
             
-            time.sleep(0.05)  # Check every 50ms
+            time.sleep(0.05)
     
     def start(self):
         """Start the keyboard monitor"""
         if self.enabled:
-            print("Keyboard shortcuts are already enabled")
-            return True
+            return
         
         self.enabled = True
         self.running = True
         self.thread = threading.Thread(target=self.monitor_thread, daemon=True)
         self.thread.start()
-        print("✓ Keyboard shortcuts enabled:")
-        print("  Ctrl+Alt+Up    → Rotate to 0° (Default)")
-        print("  Ctrl+Alt+Right → Rotate to 90°")
-        print("  Ctrl+Alt+Down  → Rotate to 180°")
-        print("  Ctrl+Alt+Left  → Rotate to 270°")
-        return True
     
     def stop(self):
         """Stop the keyboard monitor"""
@@ -299,18 +382,15 @@ class KeyboardMonitor:
         if self.thread:
             self.thread.join(timeout=0.5)
             self.thread = None
-        print("✓ Keyboard shortcuts disabled")
-
-# Global keyboard monitor instance (will be initialized in main)
-keyboard_monitor = None
 
 class ScreenRotator:
-    def __init__(self):
+    def __init__(self, update_callback=None):
         self.current_orientation = self.get_current_orientation()
         self.screen_width = user32.GetSystemMetrics(0)
         self.screen_height = user32.GetSystemMetrics(1)
-        # Update mouse remapper with current orientation
-        mouse_remapper.set_orientation(self.current_orientation, self.screen_width, self.screen_height)
+        self.update_callback = update_callback
+        self.cursor_rotator = CursorRotator()
+        self.cursor_rotation_enabled = True  # Default enabled
         
     def get_current_orientation(self):
         """Get the current screen orientation"""
@@ -322,24 +402,17 @@ class ScreenRotator:
         return DMDO_DEFAULT
     
     def rotate_screen(self, orientation):
-        """
-        Rotate the screen to the specified orientation
-        orientation: 0 (0°), 1 (90°), 2 (180°), 3 (270°)
-        """
+        """Rotate the screen to the specified orientation"""
         devmode = DEVMODE()
         devmode.dmSize = ctypes.sizeof(DEVMODE)
         
         if not user32.EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, ctypes.byref(devmode)):
-            print("Failed to get current display settings")
-            return False
+            return False, "Failed to get current display settings"
         
-        # Get the native (non-rotated) dimensions
-        # If currently rotated 90° or 270°, width/height are already swapped
         current_orientation = devmode.dmDisplayOrientation
         current_width = devmode.dmPelsWidth
         current_height = devmode.dmPelsHeight
         
-        # Determine native dimensions (as if at 0°)
         if current_orientation in (DMDO_90, DMDO_270):
             native_width = current_height
             native_height = current_width
@@ -347,10 +420,8 @@ class ScreenRotator:
             native_width = current_width
             native_height = current_height
         
-        # Set the orientation
         devmode.dmDisplayOrientation = orientation
         
-        # Set width and height based on target orientation
         if orientation in (DMDO_90, DMDO_270):
             devmode.dmPelsWidth = native_height
             devmode.dmPelsHeight = native_width
@@ -358,48 +429,25 @@ class ScreenRotator:
             devmode.dmPelsWidth = native_width
             devmode.dmPelsHeight = native_height
         
-        # Set flags to indicate which fields are being changed
         devmode.dmFields = DM_DISPLAYORIENTATION | DM_PELSWIDTH | DM_PELSHEIGHT
         
-        # Apply the changes
         result = user32.ChangeDisplaySettingsW(ctypes.byref(devmode), CDS_UPDATEREGISTRY)
         
         if result == DISP_CHANGE_SUCCESSFUL:
-            print(f"✓ Screen rotated successfully to {orientation * 90}°")
             self.current_orientation = orientation
-            # Update screen dimensions
             self.screen_width = user32.GetSystemMetrics(0)
             self.screen_height = user32.GetSystemMetrics(1)
-            print(f"  New resolution: {self.screen_width}x{self.screen_height}")
-            # Update mouse remapper
-            mouse_remapper.set_orientation(orientation, self.screen_width, self.screen_height)
-            return True
+            
+            # Rotate cursor to match screen orientation if enabled
+            if self.cursor_rotation_enabled:
+                self.cursor_rotator.rotate_cursors(orientation)
+            
+            if self.update_callback:
+                self.update_callback()
+            
+            return True, f"Rotated to {orientation * 90}°"
         else:
-            error_messages = {
-                -1: "DISP_CHANGE_RESTART - Restart required",
-                -2: "DISP_CHANGE_BADMODE - Invalid display mode",
-                -3: "DISP_CHANGE_FAILED - Display driver failed",
-                -4: "DISP_CHANGE_BADPARAM - Invalid parameter",
-                -5: "DISP_CHANGE_BADFLAGS - Invalid flags"
-            }
-            error_msg = error_messages.get(result, f"Unknown error ({result})")
-            print(f"✗ Failed to rotate screen: {error_msg}")
-            print(f"  Attempted: {devmode.dmPelsWidth}x{devmode.dmPelsHeight} @ {orientation * 90}°")
-            return False
-    
-    def rotate_clockwise(self):
-        """Rotate the screen 90 degrees clockwise"""
-        new_orientation = (self.current_orientation + 1) % 4
-        return self.rotate_screen(new_orientation)
-    
-    def rotate_counterclockwise(self):
-        """Rotate the screen 90 degrees counterclockwise"""
-        new_orientation = (self.current_orientation - 1) % 4
-        return self.rotate_screen(new_orientation)
-    
-    def rotate_to_default(self):
-        """Rotate the screen to default (0°) orientation"""
-        return self.rotate_screen(DMDO_DEFAULT)
+            return False, f"Failed to rotate (error {result})"
     
     def get_orientation_string(self):
         """Get a string representation of the current orientation"""
@@ -410,145 +458,348 @@ class ScreenRotator:
             DMDO_270: "270° (Counter-clockwise)"
         }
         return orientations.get(self.current_orientation, "Unknown")
+
+class AutoStartupManager:
+    """Manages Windows auto-startup registry entry"""
+    REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    APP_NAME = "ScreenRotator"
     
-    def get_screen_info(self):
-        """Get current screen information"""
-        return {
-            'width': self.screen_width,
-            'height': self.screen_height,
-            'orientation': self.current_orientation,
-            'orientation_degrees': self.current_orientation * 90,
-            'orientation_string': self.get_orientation_string()
+    @staticmethod
+    def is_enabled():
+        """Check if auto-startup is enabled"""
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AutoStartupManager.REG_PATH, 0, winreg.KEY_READ)
+            try:
+                winreg.QueryValueEx(key, AutoStartupManager.APP_NAME)
+                winreg.CloseKey(key)
+                return True
+            except WindowsError:
+                winreg.CloseKey(key)
+                return False
+        except WindowsError:
+            return False
+    
+    @staticmethod
+    def enable():
+        """Enable auto-startup"""
+        try:
+            # Get the path to the current script
+            if getattr(sys, 'frozen', False):
+                # Running as compiled executable
+                app_path = sys.executable
+            else:
+                # Running as script
+                app_path = f'pythonw.exe "{os.path.abspath(__file__)}"'
+            
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AutoStartupManager.REG_PATH, 0, winreg.KEY_WRITE)
+            winreg.SetValueEx(key, AutoStartupManager.APP_NAME, 0, winreg.REG_SZ, app_path)
+            winreg.CloseKey(key)
+            return True, "Auto-startup enabled"
+        except Exception as e:
+            return False, f"Failed to enable auto-startup: {e}"
+    
+    @staticmethod
+    def disable():
+        """Disable auto-startup"""
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AutoStartupManager.REG_PATH, 0, winreg.KEY_WRITE)
+            try:
+                winreg.DeleteValue(key, AutoStartupManager.APP_NAME)
+            except WindowsError:
+                pass
+            winreg.CloseKey(key)
+            return True, "Auto-startup disabled"
+        except Exception as e:
+            return False, f"Failed to disable auto-startup: {e}"
+
+class ScreenRotatorGUI:
+    def __init__(self, start_minimized=False):
+        self.root = tk.Tk()
+        self.root.title("Screen Rotator")
+        self.root.geometry("450x550")
+        self.root.resizable(False, False)
+        
+        # Initialize components
+        self.rotator = ScreenRotator(update_callback=self.update_display)
+        self.mouse_remapper = MouseRemapper()
+        self.keyboard_monitor = KeyboardMonitor(callback=self.handle_hotkey)
+        
+        self.mouse_remapper.set_orientation(
+            self.rotator.current_orientation,
+            self.rotator.screen_width,
+            self.rotator.screen_height
+        )
+        
+        # System tray icon
+        self.tray_icon = None
+        
+        # Create GUI
+        self.create_widgets()
+        self.update_display()
+        
+        # Handle window close
+        self.root.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)
+        
+        if start_minimized:
+            self.root.after(100, self.minimize_to_tray)
+    
+    def create_tray_icon(self):
+        """Create system tray icon"""
+        # Create a simple icon
+        def create_image():
+            width = 64
+            height = 64
+            image = Image.new('RGB', (width, height), (255, 255, 255))
+            dc = ImageDraw.Draw(image)
+            dc.rectangle([10, 10, 54, 54], fill=(50, 150, 250), outline=(0, 0, 0))
+            dc.line([20, 32, 44, 32], fill=(255, 255, 255), width=3)
+            dc.line([32, 20, 32, 44], fill=(255, 255, 255), width=3)
+            return image
+        
+        menu = pystray.Menu(
+            item('Show', self.show_window),
+            item('Rotate 0°', lambda: self.rotate_from_tray(DMDO_DEFAULT)),
+            item('Rotate 90°', lambda: self.rotate_from_tray(DMDO_90)),
+            item('Rotate 180°', lambda: self.rotate_from_tray(DMDO_180)),
+            item('Rotate 270°', lambda: self.rotate_from_tray(DMDO_270)),
+            pystray.Menu.SEPARATOR,
+            item('Exit', self.quit_app)
+        )
+        
+        self.tray_icon = pystray.Icon("ScreenRotator", create_image(), "Screen Rotator", menu)
+    
+    def create_widgets(self):
+        """Create GUI widgets"""
+        # Title
+        title_frame = tk.Frame(self.root, bg='#2c3e50', pady=10)
+        title_frame.pack(fill='x')
+        
+        title_label = tk.Label(
+            title_frame,
+            text="Screen Rotator",
+            font=('Segoe UI', 16, 'bold'),
+            bg='#2c3e50',
+            fg='white'
+        )
+        title_label.pack()
+        
+        # Status Frame
+        status_frame = tk.LabelFrame(self.root, text="Status", font=('Segoe UI', 10, 'bold'), padx=10, pady=10)
+        status_frame.pack(padx=10, pady=10, fill='x')
+        
+        self.orientation_label = tk.Label(status_frame, text="", font=('Segoe UI', 10))
+        self.orientation_label.pack(anchor='w')
+        
+        self.resolution_label = tk.Label(status_frame, text="", font=('Segoe UI', 10))
+        self.resolution_label.pack(anchor='w')
+        
+        # Rotation Buttons
+        rotation_frame = tk.LabelFrame(self.root, text="Quick Rotation", font=('Segoe UI', 10, 'bold'), padx=10, pady=10)
+        rotation_frame.pack(padx=10, pady=10, fill='x')
+        
+        btn_frame1 = tk.Frame(rotation_frame)
+        btn_frame1.pack(pady=5)
+        
+        btn_0 = tk.Button(btn_frame1, text="0° Default", width=15, height=2, 
+                         command=lambda: self.rotate(DMDO_DEFAULT), font=('Segoe UI', 9))
+        btn_0.pack(side='left', padx=5)
+        
+        btn_90 = tk.Button(btn_frame1, text="90° Clockwise", width=15, height=2,
+                          command=lambda: self.rotate(DMDO_90), font=('Segoe UI', 9))
+        btn_90.pack(side='left', padx=5)
+        
+        btn_frame2 = tk.Frame(rotation_frame)
+        btn_frame2.pack(pady=5)
+        
+        btn_180 = tk.Button(btn_frame2, text="180° Upside Down", width=15, height=2,
+                           command=lambda: self.rotate(DMDO_180), font=('Segoe UI', 9))
+        btn_180.pack(side='left', padx=5)
+        
+        btn_270 = tk.Button(btn_frame2, text="270° Counter-CW", width=15, height=2,
+                           command=lambda: self.rotate(DMDO_270), font=('Segoe UI', 9))
+        btn_270.pack(side='left', padx=5)
+        
+        # Features Frame
+        features_frame = tk.LabelFrame(self.root, text="Features", font=('Segoe UI', 10, 'bold'), padx=10, pady=10)
+        features_frame.pack(padx=10, pady=10, fill='x')
+        
+        self.mouse_var = tk.BooleanVar(value=False)
+        mouse_check = tk.Checkbutton(
+            features_frame,
+            text="Enable Mouse Remapping (natural mouse movement when rotated)",
+            variable=self.mouse_var,
+            command=self.toggle_mouse_remapping,
+            font=('Segoe UI', 9)
+        )
+        mouse_check.pack(anchor='w', pady=5)
+        
+        self.hotkey_var = tk.BooleanVar(value=False)
+        hotkey_check = tk.Checkbutton(
+            features_frame,
+            text="Enable Keyboard Shortcuts (Ctrl+Alt+Arrow Keys)",
+            variable=self.hotkey_var,
+            command=self.toggle_keyboard_shortcuts,
+            font=('Segoe UI', 9)
+        )
+        hotkey_check.pack(anchor='w', pady=5)
+        
+        self.cursor_var = tk.BooleanVar(value=True)
+        cursor_check = tk.Checkbutton(
+            features_frame,
+            text="Rotate Cursor Icon (match cursor to screen orientation)",
+            variable=self.cursor_var,
+            font=('Segoe UI', 9)
+        )
+        cursor_check.pack(anchor='w', pady=5)
+        
+        self.startup_var = tk.BooleanVar(value=AutoStartupManager.is_enabled())
+        startup_check = tk.Checkbutton(
+            features_frame,
+            text="Start with Windows (Auto-startup)",
+            variable=self.startup_var,
+            command=self.toggle_auto_startup,
+            font=('Segoe UI', 9)
+        )
+        startup_check.pack(anchor='w', pady=5)
+        
+        # Hotkeys Info
+        info_frame = tk.LabelFrame(self.root, text="Keyboard Shortcuts", font=('Segoe UI', 10, 'bold'), padx=10, pady=10)
+        info_frame.pack(padx=10, pady=10, fill='x')
+        
+        shortcuts = [
+            "Ctrl+Alt+Up    → Rotate to 0°",
+            "Ctrl+Alt+Right → Rotate to 90°",
+            "Ctrl+Alt+Down  → Rotate to 180°",
+            "Ctrl+Alt+Left  → Rotate to 270°"
+        ]
+        
+        for shortcut in shortcuts:
+            lbl = tk.Label(info_frame, text=shortcut, font=('Consolas', 9), anchor='w')
+            lbl.pack(anchor='w')
+        
+        # Bottom Buttons
+        bottom_frame = tk.Frame(self.root)
+        bottom_frame.pack(padx=10, pady=10, fill='x')
+        
+        minimize_btn = tk.Button(
+            bottom_frame,
+            text="Minimize to Tray",
+            command=self.minimize_to_tray,
+            font=('Segoe UI', 9),
+            width=20
+        )
+        minimize_btn.pack(side='left', padx=5)
+        
+        exit_btn = tk.Button(
+            bottom_frame,
+            text="Exit",
+            command=self.quit_app,
+            font=('Segoe UI', 9),
+            width=20
+        )
+        exit_btn.pack(side='right', padx=5)
+    
+    def update_display(self):
+        """Update the status display"""
+        self.orientation_label.config(
+            text=f"Current Orientation: {self.rotator.get_orientation_string()}"
+        )
+        self.resolution_label.config(
+            text=f"Screen Resolution: {self.rotator.screen_width}x{self.rotator.screen_height}"
+        )
+        
+        # Update mouse remapper with new dimensions
+        self.mouse_remapper.set_orientation(
+            self.rotator.current_orientation,
+            self.rotator.screen_width,
+            self.rotator.screen_height
+        )
+    
+    def rotate(self, orientation):
+        """Rotate the screen"""
+        # Sync cursor rotation setting
+        self.rotator.cursor_rotation_enabled = self.cursor_var.get()
+        
+        success, message = self.rotator.rotate_screen(orientation)
+        if not success:
+            messagebox.showerror("Error", message)
+    
+    def handle_hotkey(self, combo):
+        """Handle keyboard hotkey"""
+        combo_map = {
+            'UP': DMDO_DEFAULT,
+            'RIGHT': DMDO_90,
+            'DOWN': DMDO_180,
+            'LEFT': DMDO_270
         }
-
-
-def print_menu():
-    """Display the menu options"""
-    mouse_status = "ENABLED ✓" if mouse_remapper.enabled else "DISABLED ✗"
-    hotkey_status = "ENABLED ✓" if keyboard_monitor and keyboard_monitor.enabled else "DISABLED ✗"
-    print("\n" + "="*50)
-    print("Screen Rotator - With Mouse Remapping & Hotkeys")
-    print("="*50)
-    print(f"Mouse Remapping: {mouse_status}")
-    print(f"Keyboard Hotkeys: {hotkey_status}")
-    print("="*50)
-    print("1. Rotate Clockwise (90°)")
-    print("2. Rotate Counter-clockwise (90°)")
-    print("3. Rotate to 0° (Default)")
-    print("4. Rotate to 90°")
-    print("5. Rotate to 180°")
-    print("6. Rotate to 270°")
-    print("7. Show Current Screen Info")
-    print("8. Toggle Mouse Remapping")
-    print("9. Toggle Keyboard Shortcuts")
-    print("0. Exit")
-    print("="*50)
-
+        
+        if combo in combo_map:
+            self.rotator.rotate_screen(combo_map[combo])
+    
+    def toggle_mouse_remapping(self):
+        """Toggle mouse remapping"""
+        if self.mouse_var.get():
+            self.mouse_remapper.start()
+        else:
+            self.mouse_remapper.stop()
+    
+    def toggle_keyboard_shortcuts(self):
+        """Toggle keyboard shortcuts"""
+        if self.hotkey_var.get():
+            self.keyboard_monitor.start()
+        else:
+            self.keyboard_monitor.stop()
+    
+    def toggle_auto_startup(self):
+        """Toggle auto-startup"""
+        if self.startup_var.get():
+            success, message = AutoStartupManager.enable()
+        else:
+            success, message = AutoStartupManager.disable()
+        
+        if not success:
+            messagebox.showerror("Error", message)
+            self.startup_var.set(AutoStartupManager.is_enabled())
+    
+    def minimize_to_tray(self):
+        """Minimize window to system tray"""
+        self.root.withdraw()
+        
+        if not self.tray_icon:
+            self.create_tray_icon()
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+    
+    def show_window(self):
+        """Show window from system tray"""
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+    
+    def rotate_from_tray(self, orientation):
+        """Rotate screen from tray menu"""
+        self.rotator.rotate_screen(orientation)
+    
+    def quit_app(self):
+        """Quit the application"""
+        self.mouse_remapper.stop()
+        self.keyboard_monitor.stop()
+        
+        if self.tray_icon:
+            self.tray_icon.stop()
+        
+        self.root.quit()
+        self.root.destroy()
+    
+    def run(self):
+        """Run the application"""
+        self.root.mainloop()
 
 def main():
-    """Main function to run the screen rotator application"""
-    global keyboard_monitor
+    # Check for command line arguments
+    start_minimized = '--minimized' in sys.argv or '--startup' in sys.argv
     
-    print("Initializing Screen Rotator...")
-    
-    # Register cleanup on exit
-    def cleanup():
-        mouse_remapper.stop()
-        if keyboard_monitor:
-            keyboard_monitor.stop()
-    
-    atexit.register(cleanup)
-    
-    try:
-        rotator = ScreenRotator()
-        keyboard_monitor = KeyboardMonitor(rotator)
-        
-        print(f"Current orientation: {rotator.get_orientation_string()}")
-        print(f"Screen resolution: {rotator.screen_width}x{rotator.screen_height}")
-        print("\nTips:")
-        print("• Enable mouse remapping (option 8) to make mouse movements")
-        print("  feel natural when the screen is rotated!")
-        print("• Enable keyboard shortcuts (option 9) for quick rotation with")
-        print("  Ctrl+Alt+Arrow keys!")
-        
-        while True:
-            print_menu()
-            choice = input("\nEnter your choice (0-9): ").strip()
-            
-            if choice == '1':
-                print("\nRotating clockwise...")
-                rotator.rotate_clockwise()
-                
-            elif choice == '2':
-                print("\nRotating counter-clockwise...")
-                rotator.rotate_counterclockwise()
-                
-            elif choice == '3':
-                print("\nRotating to default (0°)...")
-                rotator.rotate_to_default()
-                
-            elif choice == '4':
-                print("\nRotating to 90°...")
-                rotator.rotate_screen(DMDO_90)
-                
-            elif choice == '5':
-                print("\nRotating to 180°...")
-                rotator.rotate_screen(DMDO_180)
-                
-            elif choice == '6':
-                print("\nRotating to 270°...")
-                rotator.rotate_screen(DMDO_270)
-                
-            elif choice == '7':
-                info = rotator.get_screen_info()
-                print("\n" + "-"*50)
-                print("Current Screen Information:")
-                print("-"*50)
-                print(f"Width: {info['width']}px")
-                print(f"Height: {info['height']}px")
-                print(f"Orientation: {info['orientation_string']}")
-                print(f"Orientation Value: {info['orientation']}")
-                print(f"Degrees: {info['orientation_degrees']}°")
-                print(f"Mouse Remapping: {'ENABLED' if mouse_remapper.enabled else 'DISABLED'}")
-                print(f"Keyboard Shortcuts: {'ENABLED' if keyboard_monitor.enabled else 'DISABLED'}")
-                print("-"*50)
-                
-            elif choice == '8':
-                if mouse_remapper.enabled:
-                    mouse_remapper.stop()
-                else:
-                    mouse_remapper.start()
-                    if mouse_remapper.enabled:
-                        print("\nNote: Mouse remapping works best when screen is rotated.")
-                        print("      At 0°, movements are unchanged.")
-                
-            elif choice == '9':
-                if keyboard_monitor.enabled:
-                    keyboard_monitor.stop()
-                else:
-                    keyboard_monitor.start()
-                    
-            elif choice == '0':
-                print("\nExiting Screen Rotator. Goodbye!")
-                cleanup()
-                break
-                
-            else:
-                print("\nInvalid choice. Please enter a number between 0 and 9.")
-            
-            time.sleep(0.3)  # Small delay for better user experience
-    
-    except KeyboardInterrupt:
-        print("\n\nProgram interrupted by user. Exiting...")
-        cleanup()
-    except Exception as e:
-        print(f"\nAn error occurred: {e}")
-        import traceback
-        traceback.print_exc()
-        cleanup()
-
+    app = ScreenRotatorGUI(start_minimized=start_minimized)
+    app.run()
 
 if __name__ == "__main__":
-    print("Note: This application requires administrator privileges to rotate the screen.")
-    print("Please run this script as administrator.\n")
     main()
