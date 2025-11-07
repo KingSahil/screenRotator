@@ -24,6 +24,13 @@ except ImportError as e:
     print("pip install pillow pystray")
     sys.exit(1)
 
+# Enable high-resolution timer on Windows for better sleep precision
+try:
+    winmm = ctypes.windll.winmm
+    winmm.timeBeginPeriod(1)  # Request 1ms timer resolution
+except:
+    pass
+
 # Constants for display orientation
 DMDO_DEFAULT = 0  # 0 degrees
 DMDO_90 = 1       # 90 degrees
@@ -212,7 +219,7 @@ class CursorRotator:
             print(f"Error restoring cursors: {e}")
 
 class MouseRemapper:
-    """Enhanced mouse remapping with smooth operation"""
+    """Optimized mouse remapping for near-native feel"""
     def __init__(self):
         self.enabled = False
         self.current_orientation = DMDO_DEFAULT
@@ -220,85 +227,118 @@ class MouseRemapper:
         self.screen_height = 0
         self.thread = None
         self.running = False
-        self.last_update_time = 0
+        
+        # High-performance tracking
+        self.last_physical_x = 0
+        self.last_physical_y = 0
+        self.ignore_next_read = False
+        
+        # Pre-allocate POINT structure for better performance
+        self.point_struct = POINT()
         
     def set_orientation(self, orientation, width, height):
         """Update the current orientation and screen dimensions"""
         self.current_orientation = orientation
         self.screen_width = width
         self.screen_height = height
+        
+        # Reset tracking when orientation changes
+        user32.GetCursorPos(ctypes.byref(self.point_struct))
+        self.last_physical_x = self.point_struct.x
+        self.last_physical_y = self.point_struct.y
+        self.ignore_next_read = False
     
     def remap_thread(self):
-        """Background thread that monitors and adjusts mouse position"""
-        last_pos = POINT()
-        user32.GetCursorPos(ctypes.byref(last_pos))
-        last_raw_pos = (last_pos.x, last_pos.y)
-        moved_by_us = False
+        """Optimized background thread for mouse remapping with minimal latency"""
+        # Initialize with current position
+        user32.GetCursorPos(ctypes.byref(self.point_struct))
+        self.last_physical_x = self.point_struct.x
+        self.last_physical_y = self.point_struct.y
+        
+        # Pre-calculate constants outside loop
+        orientation = self.current_orientation
         
         while self.running:
-            if self.current_orientation == DMDO_DEFAULT or not self.enabled:
-                time.sleep(0.01)
+            # Skip processing if not enabled or at default orientation
+            if not self.enabled or self.current_orientation == DMDO_DEFAULT:
+                time.sleep(0.005)
+                # Update orientation reference
+                orientation = self.current_orientation
                 continue
             
-            current_pos = POINT()
-            user32.GetCursorPos(ctypes.byref(current_pos))
-            current_raw = (current_pos.x, current_pos.y)
-            
-            # Check if we just moved the cursor
-            if moved_by_us:
-                moved_by_us = False
-                last_raw_pos = current_raw
-                last_pos.x = current_pos.x
-                last_pos.y = current_pos.y
-                time.sleep(0.002)
+            # Check if orientation changed
+            if orientation != self.current_orientation:
+                orientation = self.current_orientation
+                user32.GetCursorPos(ctypes.byref(self.point_struct))
+                self.last_physical_x = self.point_struct.x
+                self.last_physical_y = self.point_struct.y
+                self.ignore_next_read = False
                 continue
             
-            # Calculate delta from last known position
-            dx = current_pos.x - last_pos.x
-            dy = current_pos.y - last_pos.y
+            # Skip this read if we just moved the cursor
+            if self.ignore_next_read:
+                user32.GetCursorPos(ctypes.byref(self.point_struct))
+                self.last_physical_x = self.point_struct.x
+                self.last_physical_y = self.point_struct.y
+                self.ignore_next_read = False
+                time.sleep(0.0005)  # Minimal sleep after our move
+                continue
+            
+            # Get current cursor position (fast)
+            user32.GetCursorPos(ctypes.byref(self.point_struct))
+            current_x = self.point_struct.x
+            current_y = self.point_struct.y
+            
+            # Calculate delta (physical mouse movement)
+            dx = current_x - self.last_physical_x
+            dy = current_y - self.last_physical_y
             
             # Only process if there's actual movement
-            if abs(dx) > 0 or abs(dy) > 0:
-                # Transform the delta based on orientation
-                if self.current_orientation == DMDO_90:  # 90° CW
-                    new_dx, new_dy = -dy, dx
-                elif self.current_orientation == DMDO_180:  # 180°
-                    new_dx, new_dy = -dx, -dy
-                elif self.current_orientation == DMDO_270:  # 270° CW (90° CCW)
-                    new_dx, new_dy = dy, -dx
+            if dx != 0 or dy != 0:
+                # Transform delta based on orientation (pre-calculated in if-elif chain)
+                if orientation == DMDO_90:  # 90° CW
+                    transformed_dx = -dy
+                    transformed_dy = dx
+                elif orientation == DMDO_180:  # 180°
+                    transformed_dx = -dx
+                    transformed_dy = -dy
+                elif orientation == DMDO_270:  # 270° CW (90° CCW)
+                    transformed_dx = dy
+                    transformed_dy = -dx
                 else:
-                    new_dx, new_dy = dx, dy
+                    transformed_dx = dx
+                    transformed_dy = dy
                 
-                # Calculate new position based on LAST position + transformed delta
-                # This prevents feedback loops
-                new_x = last_pos.x + new_dx
-                new_y = last_pos.y + new_dy
+                # Calculate new position from last known position
+                new_x = self.last_physical_x + transformed_dx
+                new_y = self.last_physical_y + transformed_dy
                 
-                # Clamp to screen bounds
-                new_x = max(0, min(self.screen_width - 1, new_x))
-                new_y = max(0, min(self.screen_height - 1, new_y))
+                # Clamp to screen bounds (fast min/max)
+                if new_x < 0:
+                    new_x = 0
+                elif new_x >= self.screen_width:
+                    new_x = self.screen_width - 1
+                    
+                if new_y < 0:
+                    new_y = 0
+                elif new_y >= self.screen_height:
+                    new_y = self.screen_height - 1
                 
-                # Only move if position changed
-                if new_x != current_pos.x or new_y != current_pos.y:
-                    user32.SetCursorPos(new_x, new_y)
-                    moved_by_us = True
-                    # Update last position to where we moved it
-                    last_pos.x = new_x
-                    last_pos.y = new_y
-                else:
-                    # Position didn't change, just update tracking
-                    last_pos.x = current_pos.x
-                    last_pos.y = current_pos.y
+                # Move cursor to new position
+                user32.SetCursorPos(new_x, new_y)
+                
+                # Update last known position to where we moved it
+                self.last_physical_x = new_x
+                self.last_physical_y = new_y
+                
+                # Flag to ignore the next read (our own movement)
+                self.ignore_next_read = True
             else:
-                # No movement, just update tracking
-                last_pos.x = current_pos.x
-                last_pos.y = current_pos.y
-            
-            last_raw_pos = current_raw
-            time.sleep(0.002)  # 2ms polling for smooth movement
+                # No movement detected, minimal sleep
+                time.sleep(0.0005)  # 0.5ms sleep when idle
     
     def start(self):
-        """Start the mouse remapping"""
+        """Start the mouse remapping with high priority"""
         if self.enabled:
             return
         
@@ -306,6 +346,31 @@ class MouseRemapper:
         self.running = True
         self.thread = threading.Thread(target=self.remap_thread, daemon=True)
         self.thread.start()
+        
+        # Boost thread priority for better responsiveness
+        try:
+            import win32api
+            import win32process
+            import win32con
+            
+            # Get thread handle and boost priority
+            thread_id = self.thread.ident
+            if thread_id:
+                # Set to highest non-realtime priority
+                handle = win32api.OpenThread(win32con.THREAD_SET_INFORMATION, False, thread_id)
+                win32process.SetThreadPriority(handle, win32process.THREAD_PRIORITY_HIGHEST)
+                win32api.CloseHandle(handle)
+        except ImportError:
+            # win32api not available, use ctypes alternative
+            try:
+                kernel32 = ctypes.windll.kernel32
+                thread_handle = kernel32.OpenThread(0x0020, False, self.thread.ident)  # THREAD_SET_INFORMATION
+                if thread_handle:
+                    # THREAD_PRIORITY_HIGHEST = 2
+                    kernel32.SetThreadPriority(thread_handle, 2)
+                    kernel32.CloseHandle(thread_handle)
+            except:
+                pass  # If priority boost fails, continue without it
     
     def stop(self):
         """Stop the mouse remapping"""
