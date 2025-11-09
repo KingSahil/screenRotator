@@ -602,6 +602,10 @@ class ScreenRotatorGUI:
         self.create_widgets()
         self.update_display()
         
+        # Start all features by default
+        self.mouse_remapper.start()
+        self.keyboard_monitor.start()
+        
         # Handle window close
         self.root.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)
         
@@ -688,7 +692,7 @@ class ScreenRotatorGUI:
         features_frame = tk.LabelFrame(self.root, text="Features", font=('Segoe UI', 10, 'bold'), padx=10, pady=10)
         features_frame.pack(padx=10, pady=10, fill='x')
         
-        self.mouse_var = tk.BooleanVar(value=False)
+        self.mouse_var = tk.BooleanVar(value=True)  # Enabled by default
         mouse_check = tk.Checkbutton(
             features_frame,
             text="Enable Mouse Remapping (natural mouse movement when rotated)",
@@ -698,7 +702,7 @@ class ScreenRotatorGUI:
         )
         mouse_check.pack(anchor='w', pady=5)
         
-        self.hotkey_var = tk.BooleanVar(value=False)
+        self.hotkey_var = tk.BooleanVar(value=True)  # Enabled by default
         hotkey_check = tk.Checkbutton(
             features_frame,
             text="Enable Keyboard Shortcuts (Ctrl+Alt+Arrow Keys)",
@@ -708,7 +712,7 @@ class ScreenRotatorGUI:
         )
         hotkey_check.pack(anchor='w', pady=5)
         
-        self.cursor_var = tk.BooleanVar(value=True)
+        self.cursor_var = tk.BooleanVar(value=True)  # Already enabled by default
         cursor_check = tk.Checkbutton(
             features_frame,
             text="Rotate Cursor Icon (match cursor to screen orientation)",
