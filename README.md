@@ -1,5 +1,7 @@
 # Screen Rotator
 
+WARNING: the 180 degree feature not working correctly (ctrl + c on the terminal to close the program in windows)
+
 A Windows application to rotate your screen with mouse remapping and keyboard shortcuts.
 
 ## Features
